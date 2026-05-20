@@ -1,0 +1,17 @@
+{
+  "name": "smi-metaverso-perf",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Room loading performance benchmark — Playwright runner. Independent of the npm workspaces; do NOT add this folder to the root workspaces glob.",
+  "type": "module",
+  "scripts": {
+    "flow": "playwright test flow.spec.ts",
+    "install:browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^22.0.0",
+    "dotenv": "^16.4.0",
+    "typescript": "^5.9.0"
+  }
+}

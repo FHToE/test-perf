@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# local config (committed template: .env.example)
+.env
+.env.local
+.env.*.local
+
+# benchmark output (regenerated each run; copy/archive manually if you want to keep)
+results/
+results-*/
+test-results/
+playwright-report/
+
+# logs / scratch
+*.log
+.DS_Store
+Thumbs.db
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
