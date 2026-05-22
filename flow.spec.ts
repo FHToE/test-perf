@@ -68,7 +68,6 @@ function gitSha(): string | null {
 }
 
 reporter.setMeta({
-  bench_label: cfg.label,
   git_sha: gitSha(),
   chrome_user_agent: null, // populated after first page boot (set in test)
   gpu_renderer: process.env.BENCH_GPU_RENDERER || null, // optional; global-setup could persist
@@ -84,12 +83,16 @@ reporter.setMeta({
 let sharedContext: BrowserContext | null = null;
 let sharedPage: Page | null = null;
 
+// Dry-run video lives in `<baseDir>/videos/` (NOT inside runDir) so finalize()'s
+// rename of runDir doesn't race with Playwright's video file handle on Windows.
+const dryRunVideoDir = path.join(reporter.baseRunDir, "videos");
+
 test.beforeAll(async ({ browser }) => {
   if (!cfg.dryRun) return;
   sharedContext = await browser.newContext({
     viewport: { width: 1280, height: 720 },
     recordVideo: {
-      dir: path.join(cfg.outputDir, "videos"),
+      dir: dryRunVideoDir,
       size: { width: 1280, height: 720 },
     },
   });
@@ -101,15 +104,18 @@ test.beforeAll(async ({ browser }) => {
 });
 
 test.afterAll(async () => {
-  reporter.writeSummary();
-  reporter.printConsoleSummary();
-
+  // Close shared context + save combined video. Video is in baseDir/videos/, NOT
+  // runDir — finalize() can rename runDir freely without touching the video file.
   if (sharedContext && sharedPage) {
     const videoObj = sharedPage.video();
-    await sharedPage.close().catch(() => undefined);
-    await sharedContext.close().catch(() => undefined);
+    await sharedPage.close().catch((e) => {
+      console.warn(`[flow] sharedPage.close failed: ${(e as Error).message}`);
+    });
+    await sharedContext.close().catch((e) => {
+      console.warn(`[flow] sharedContext.close failed: ${(e as Error).message}`);
+    });
     if (videoObj) {
-      const combinedPath = path.join(cfg.outputDir, "videos", "combined.webm");
+      const combinedPath = path.join(dryRunVideoDir, `combined-${reporter.runId}.webm`);
       try {
         await videoObj.saveAs(combinedPath);
         await videoObj.delete();
@@ -121,6 +127,11 @@ test.afterAll(async () => {
       }
     }
   }
+
+  reporter.finalize();
+  reporter.writeSummary();
+  reporter.writeDeltaVsPrevious();
+  reporter.printConsoleSummary();
 });
 
 for (const room of cfg.rooms) {
@@ -158,9 +169,9 @@ for (const room of cfg.rooms) {
       }
 
       const slug = roomSlug(room);
-      const logFile = path.join(cfg.outputDir, "logs", `iter-${iterIdx}_${slug}.page.log`);
-      const flowLogFile = path.join(cfg.outputDir, "logs", `iter-${iterIdx}_${slug}.flow.log`);
-      const screenshotsDir = path.join(cfg.outputDir, "flow", `iter-${iterIdx}_${slug}`);
+      const logFile = path.join(reporter.runDir, "logs", `iter-${iterIdx}_${slug}.page.log`);
+      const flowLogFile = path.join(reporter.runDir, "logs", `iter-${iterIdx}_${slug}.flow.log`);
+      const screenshotsDir = path.join(reporter.runDir, "flow", `iter-${iterIdx}_${slug}`);
       fs.mkdirSync(path.dirname(flowLogFile), { recursive: true });
       const flowLogStream = fs.createWriteStream(flowLogFile, { flags: "w" });
 
@@ -193,6 +204,25 @@ for (const room of cfg.rooms) {
       // eslint-disable-next-line no-console
       console.log(`  → ${startUrl}`);
 
+      // Accumulator for phase snapshots that would otherwise be lost across page
+       // reloads (page.reload replaces the JS realm — fresh empty collector). We snapshot
+       // BEFORE each reload via ensureRoomLoadedWithRetry's onBeforeReload callback,
+       // merge into this map, then take the final snapshot at iteration end and merge again.
+      const snapshotAccumulator: Record<string, import("./helpers/phases.js").PhaseSnapshot> = {};
+      const mergeFromPage = async (): Promise<void> => {
+        try {
+          const snap = await getPhaseSnapshot(page);
+          for (const [name, val] of Object.entries(snap)) {
+            // Reloads happen BETWEEN phases (ensureRoomLoadedWithRetry is never called
+            // while a phase is open), so each phase appears in at most ONE realm — no
+            // need to concatenate frame arrays, simple assignment is sufficient.
+            snapshotAccumulator[name] = val;
+          }
+        } catch (e) {
+          console.warn(`[flow] mergeFromPage failed: ${(e as Error).message}`);
+        }
+      };
+
       let assetsLobby: AssetMetrics | null = null;
       let assetsTargetRoom: AssetMetrics | null = null;
       let assetsNextRoom: AssetMetrics | null = null;
@@ -207,7 +237,7 @@ for (const room of cfg.rooms) {
         await step2_closeHelpDialog(ctx);
 
         // Lobby is fully loaded. Asset window for lobby = everything fetched so far.
-        assetsLobby = await captureAssetsSince(page, 0, cfg.assetHostFilter);
+        assetsLobby = await captureAssetsSince(page, 0);
         const resourcesAfterLobby = await getResourceCount(page);
         ctx.log(`assets_lobby: window=${assetsLobby.window_ms}ms count=${assetsLobby.count} bytes=${assetsLobby.total_bytes}`);
 
@@ -233,7 +263,7 @@ for (const room of cfg.rooms) {
         await endPhase(page, PHASE_NAMES.TRANSITION_TO_TARGET);
 
         // Asset window for target_room = everything fetched since lobby was loaded
-        assetsTargetRoom = await captureAssetsSince(page, resourcesAfterLobby, cfg.assetHostFilter);
+        assetsTargetRoom = await captureAssetsSince(page, resourcesAfterLobby);
         const resourcesAfterTargetRoom = await getResourceCount(page);
         ctx.log(`assets_target_room: window=${assetsTargetRoom.window_ms}ms count=${assetsTargetRoom.count} bytes=${assetsTargetRoom.total_bytes}`);
 
@@ -245,7 +275,7 @@ for (const room of cfg.rooms) {
 
           // Health check: confirm room mesh actually loaded (skybox+minimap render
           // even when GLB load failed). Retry with page.reload() on fail, track count.
-          const targetCheck = await ensureRoomLoadedWithRetry(ctx, cfg.transitionTimeoutSec * 1000);
+          const targetCheck = await ensureRoomLoadedWithRetry(ctx, cfg.transitionTimeoutSec * 1000, 2, mergeFromPage);
           targetRoomReloads = targetCheck.reloadCount;
           const targetMeshOk = targetCheck.loaded;
           if (!targetMeshOk) {
@@ -298,11 +328,11 @@ for (const room of cfg.rooms) {
           await endPhase(page, PHASE_NAMES.TRANSITION_TO_NEXT);
 
           if (portalUsed) {
-            assetsNextRoom = await captureAssetsSince(page, resourcesAfterTargetRoom, cfg.assetHostFilter);
+            assetsNextRoom = await captureAssetsSince(page, resourcesAfterTargetRoom);
             ctx.log(`assets_next_room: window=${assetsNextRoom.window_ms}ms count=${assetsNextRoom.count} bytes=${assetsNextRoom.total_bytes}`);
 
             // Health check: confirm next room mesh loaded too (with retry on fail)
-            const nextCheck = await ensureRoomLoadedWithRetry(ctx, cfg.transitionTimeoutSec * 1000);
+            const nextCheck = await ensureRoomLoadedWithRetry(ctx, cfg.transitionTimeoutSec * 1000, 2, mergeFromPage);
             nextRoomReloads = nextCheck.reloadCount;
             const nextMeshOk = nextCheck.loaded;
             if (!nextMeshOk) {
@@ -350,11 +380,15 @@ for (const room of cfg.rooms) {
 
         await page.screenshot({ path: path.join(screenshotsDir, "ZZ-final.png") }).catch(() => undefined);
 
-        // Pull collector snapshot + compute per-phase metrics
-        const snap = await getPhaseSnapshot(page);
+        // Pull final collector snapshot + merge with accumulator (which holds any
+        // phase data salvaged before page reloads — see snapshotAccumulator comment).
+        const finalSnap = await getPhaseSnapshot(page);
+        for (const [name, val] of Object.entries(finalSnap)) {
+          snapshotAccumulator[name] = val;
+        }
         const phaseMetrics: IterationResult["phases"] = {};
         for (const name of Object.values(PHASE_NAMES)) {
-          const m = computePhaseMetrics(snap[name]);
+          const m = computePhaseMetrics(snapshotAccumulator[name]);
           if (m) phaseMetrics[name] = m;
         }
 
@@ -363,11 +397,29 @@ for (const room of cfg.rooms) {
           .evaluate(() => (window as unknown as { __webglContextStats?: () => { peak: number } }).__webglContextStats?.())
           .catch(() => undefined)) as { peak: number } | undefined;
 
+        // Lightweight diagnostics — confirms the two hooks that drove past bugs are
+        // healthy. Drop entirely once the bench has run cleanly on cloud for a while.
+        const diagnostics = (await page
+          .evaluate(() => {
+            const w = window as unknown as {
+              __gltfParseTracker?: { snapshot: () => { pending: unknown[]; completed: unknown[]; droppedStale: number } };
+              __webglContextStats?: () => { peak: number; hasTimerQuery: boolean };
+            };
+            const gltfSnap = w.__gltfParseTracker?.snapshot();
+            const webglStats = w.__webglContextStats?.();
+            return {
+              gltf_pending: gltfSnap?.pending.length ?? -1,
+              gltf_completed: gltfSnap?.completed.length ?? -1,
+              gltf_dropped_stale: gltfSnap?.droppedStale ?? -1,
+              has_gpu_timer_query: webglStats?.hasTimerQuery ?? false,
+            };
+          })
+          .catch(() => undefined)) as Record<string, unknown> | undefined;
+
         const result: IterationResult = {
           starting_room: room,
           iteration: iterIdx,
           timestamp: new Date().toISOString(),
-          label: cfg.label,
           assets_lobby: assetsLobby,
           assets_target_room: assetsTargetRoom,
           assets_next_room: assetsNextRoom,
@@ -376,6 +428,7 @@ for (const room of cfg.rooms) {
           target_room_reloads: targetRoomReloads,
           next_room_reloads: nextRoomReloads,
           notes: notes.length ? notes : undefined,
+          diagnostics,
         };
         reporter.add(result);
 

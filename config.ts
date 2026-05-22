@@ -9,11 +9,8 @@ export interface BenchConfig {
   roomIdleSec: number;
   poiOpenSec: number;
   transitionTimeoutSec: number;
+  /** BASE directory for results. Reporter creates a per-run subfolder named by start/end timestamps. */
   outputDir: string;
-  /** Optional run label (e.g. "ff-off" / "ff-on") for before/after comparison. */
-  label: string | null;
-  /** Only asset URLs containing this string contribute to asset windows. Default = no filter. */
-  assetHostFilter: string | null;
   /** Dry run: force 1 iteration per room, record video, write to results-dry-run/ so real metrics aren't polluted. */
   dryRun: boolean;
 }
@@ -60,8 +57,6 @@ export function loadConfig(): BenchConfig {
     poiOpenSec: numEnv("BENCH_POI_OPEN_SEC", 8),
     transitionTimeoutSec: numEnv("BENCH_TRANSITION_TIMEOUT_SEC", 60),
     outputDir: process.env.BENCH_OUTPUT_DIR || defaultOutDir,
-    label: process.env.BENCH_LABEL || null,
-    assetHostFilter: process.env.BENCH_ASSET_HOST_FILTER || null,
     dryRun,
   };
 }

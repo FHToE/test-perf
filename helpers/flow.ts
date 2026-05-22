@@ -462,6 +462,13 @@ export async function ensureRoomLoadedWithRetry(
   ctx: FlowContext,
   loadTimeoutMs: number,
   maxRetries = 2,
+  /**
+   * Called by the caller BEFORE each page.reload() so it can pull the current
+   * collector snapshot and merge it into a cross-realm accumulator. Page reload
+   * replaces the JS realm — without this hook, all phase samples collected up to
+   * this point are lost when the new realm starts with a fresh empty collector.
+   */
+  onBeforeReload?: () => Promise<void>,
 ): Promise<{ loaded: boolean; reloadCount: number }> {
   let loaded = await probeRoomLoaded(ctx);
   let reloadCount = 0;
@@ -470,6 +477,9 @@ export async function ensureRoomLoadedWithRetry(
     reloadCount++;
     ctx.log(`room-load: mesh missing — reload attempt ${reloadCount}/${maxRetries}`);
     await snap(ctx, `room-load-FAIL-pre-reload-${reloadCount}`);
+    if (onBeforeReload) {
+      try { await onBeforeReload(); } catch (e) { ctx.log(`room-load: onBeforeReload threw — ${(e as Error).message}`); }
+    }
     try {
       await ctx.page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
       // FE may re-show the help/controls dialog after reload — close it if so.
@@ -508,10 +518,19 @@ export async function step10_walkAround(ctx: FlowContext, durationMs: number): P
   ctx.log(`step10: round-trip walk — ${outboundSegments} forward + ${outboundSegments}+ backward`);
   await snap(ctx, "step10-walk-start");
 
-  // Outbound: walk forward, tracking actual displacement per segment
+  // Outbound: walk forward, tracking actual displacement per segment.
+  // Abort if cameraUnknown (camera hook not capturing positions) — without
+  // distance feedback we can't return to spawn, leaving subsequent phases
+  // measuring the camera at an arbitrary spot.
   let outboundDist = 0;
   for (let i = 0; i < outboundSegments; i++) {
     const w = await walkForward(ctx.page, FORWARD_MS);
+    if (w.cameraUnknown) {
+      ctx.log(`step10: ABORT — camera position unknown after outbound #${i + 1}; round-trip skipped`);
+      ctx.notes.push("step10: aborted — camera position lost (cameraHook not capturing)");
+      await snap(ctx, "step10-walk-end-aborted");
+      return;
+    }
     outboundDist += w.distance;
     ctx.log(`step10: outbound #${i + 1} — distance=${w.distance.toFixed(2)}m (cumulative=${outboundDist.toFixed(2)}m)`);
   }
@@ -525,6 +544,12 @@ export async function step10_walkAround(ctx: FlowContext, durationMs: number): P
   let inboundSegments = 0;
   for (let i = 0; i < maxInboundSegments && inboundDist < outboundDist - tolerance; i++) {
     const w = await walkBackward(ctx.page, FORWARD_MS);
+    if (w.cameraUnknown) {
+      ctx.log(`step10: ABORT — camera position unknown during inbound #${inboundSegments + 1}`);
+      ctx.notes.push("step10: aborted mid-inbound — camera position lost");
+      await snap(ctx, "step10-walk-end-aborted");
+      return;
+    }
     inboundDist += w.distance;
     inboundSegments++;
     ctx.log(`step10: inbound #${inboundSegments} — distance=${w.distance.toFixed(2)}m (cumulative=${inboundDist.toFixed(2)}m / target=${outboundDist.toFixed(2)}m)`);
@@ -654,7 +679,7 @@ async function sweepForCursor(
 
 /** Walk backward (KeyS) for `durationMs`, returning displacement (m). Same FE
  * physics as forward — useful for symmetric round-trip without rotation. */
-async function walkBackward(page: Page, durationMs: number): Promise<{ distance: number }> {
+async function walkBackward(page: Page, durationMs: number): Promise<{ distance: number; cameraUnknown?: boolean }> {
   return walkInDirection(page, "KeyS", durationMs);
 }
 
@@ -671,7 +696,7 @@ async function walkBackward(page: Page, durationMs: number): Promise<{ distance:
  *
  * Returns `{distance: number}` in metres. Caller decides what threshold means.
  */
-async function walkForward(page: Page, durationMs: number): Promise<{ distance: number }> {
+async function walkForward(page: Page, durationMs: number): Promise<{ distance: number; cameraUnknown?: boolean }> {
   return walkInDirection(page, "KeyW", durationMs);
 }
 
@@ -680,7 +705,7 @@ async function walkInDirection(
   page: Page,
   key: "KeyW" | "KeyS" | "KeyA" | "KeyD",
   durationMs: number,
-): Promise<{ distance: number }> {
+): Promise<{ distance: number; cameraUnknown?: boolean }> {
   const before = (await page.evaluate(() => (window as unknown as { __lastCameraPos: number[] | null }).__lastCameraPos)) as
     | [number, number, number]
     | null;
@@ -693,14 +718,15 @@ async function walkInDirection(
     | null;
 
   if (!before || !after) {
-    // Camera hook didn't capture cameraPosition — be conservative, claim a big move
-    // so wall-follow doesn't classify as blocked and rotate sharply.
-    return { distance: 99 };
+    // Camera hook didn't capture cameraPosition (shader not rendering / context lost).
+    // Surface as a flag so callers can decide what to do — DON'T fabricate a distance
+    // (the previous sentinel of 99 cascaded into round-trip walks trying to retrace
+    // 99m which is impossible, leaving the camera in a nondeterministic position).
+    return { distance: 0, cameraUnknown: true };
   }
-  const dx = after[0] - before[0];
-  const dy = after[1] - before[1];
-  const dz = after[2] - before[2];
   // Ignore Y (vertical) — only horizontal travel matters
+  const dx = after[0] - before[0];
+  const dz = after[2] - before[2];
   return { distance: Math.sqrt(dx * dx + dz * dz) };
 }
 

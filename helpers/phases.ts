@@ -37,6 +37,30 @@ export interface PhaseSnapshot {
   heap: { ts: number; used: number }[];
   heapTotal: { ts: number; total: number }[];
   domNodes: { ts: number; count: number }[];
+  /** Per-frame draw call count (one entry per rAF tick during the phase). */
+  drawCalls?: number[];
+  /** Per-frame triangle count (one entry per rAF tick during the phase). */
+  triangles?: number[];
+  /** Per-frame texture upload bytes (one entry per rAF tick; most frames 0). */
+  textureBytes?: number[];
+  /** Per-frame wall-clock time (ms) spent inside texImage2D/texSubImage2D/compressed* calls. */
+  textureUploadMs?: number[];
+  /** Per-frame bufferData call count. */
+  bufferDataCalls?: number[];
+  /** Per-frame bufferData bytes (geometry uploaded). */
+  bufferDataBytes?: number[];
+  /** Per-frame wall-clock time (ms) spent inside bufferData calls. */
+  bufferDataMs?: number[];
+  /** GPU frame time (ms) via EXT_disjoint_timer_query — one entry per completed query.
+   * Arrives 1-3 frames after the frame it measured; aggregation hides the lag. Empty
+   * if the extension is unavailable (some headless / VM environments). */
+  gpuFrameTimesMs?: number[];
+  /** GLB parses (fetch-end → first bufferData) that completed during this phase. */
+  glbParseSamples?: { url: string; parseTimeMs: number; bytes: number }[];
+  /** Cumulative WebGLProgram count at startPhase. -1 if not captured. */
+  programsStart?: number;
+  /** Cumulative WebGLProgram count at endPhase. -1 if not captured. */
+  programsEnd?: number;
   startTs: number;
   endTs: number;
 }
@@ -71,38 +95,27 @@ export async function getPhaseSnapshot(page: Page): Promise<Record<string, Phase
  * loads, passes the count here after, gets back `{window_ms, total_bytes, count}`
  * attributed to the new entries only.
  */
-export async function captureAssetsSince(
-  page: Page,
-  sinceIndex: number,
-  hostFilter: string | null = null,
-): Promise<AssetMetrics> {
-  return page.evaluate(
-    ({ since, hostSubstr }) => {
-      const all = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
-      const newEntries = all.slice(since);
-      const assetExt = /\.(glb|gltf|jpg|jpeg|png|webp|avif|mp4|mp3|ply|pdf)(\?|$)/i;
-      const meshExt = /\.(glb|gltf|ply)(\?|$)/i;
-      const assets = newEntries.filter((e) => {
-        if (!assetExt.test(e.name)) return false;
-        if (hostSubstr && !e.name.includes(hostSubstr)) return false;
-        return true;
-      });
-      if (assets.length === 0) {
-        return { window_ms: 0, total_bytes: 0, count: 0, mesh_count: 0 };
-      }
-      const earliest = Math.min(...assets.map((e) => e.startTime));
-      const latest = Math.max(...assets.map((e) => e.responseEnd));
-      const totalBytes = assets.reduce((s, e) => s + (e.encodedBodySize || e.transferSize || 0), 0);
-      const meshCount = assets.filter((e) => meshExt.test(e.name)).length;
-      return {
-        window_ms: Math.round(latest - earliest),
-        total_bytes: totalBytes,
-        count: assets.length,
-        mesh_count: meshCount,
-      };
-    },
-    { since: sinceIndex, hostSubstr: hostFilter },
-  );
+export async function captureAssetsSince(page: Page, sinceIndex: number): Promise<AssetMetrics> {
+  return page.evaluate((since) => {
+    const all = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+    const newEntries = all.slice(since);
+    const assetExt = /\.(glb|gltf|jpg|jpeg|png|webp|avif|mp4|mp3|ply|pdf)(\?|$)/i;
+    const meshExt = /\.(glb|gltf|ply)(\?|$)/i;
+    const assets = newEntries.filter((e) => assetExt.test(e.name));
+    if (assets.length === 0) {
+      return { window_ms: 0, total_bytes: 0, count: 0, mesh_count: 0 };
+    }
+    const earliest = Math.min(...assets.map((e) => e.startTime));
+    const latest = Math.max(...assets.map((e) => e.responseEnd));
+    const totalBytes = assets.reduce((s, e) => s + (e.encodedBodySize || e.transferSize || 0), 0);
+    const meshCount = assets.filter((e) => meshExt.test(e.name)).length;
+    return {
+      window_ms: Math.round(latest - earliest),
+      total_bytes: totalBytes,
+      count: assets.length,
+      mesh_count: meshCount,
+    };
+  }, sinceIndex);
 }
 
 export async function getResourceCount(page: Page): Promise<number> {
