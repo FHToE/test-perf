@@ -119,6 +119,8 @@ export interface RunMeta {
   started_at: string;
   /** Set by Reporter.finalize() once all iterations are done. */
   ended_at?: string;
+  /** Host machine info captured at run start (os, cpu, ram). */
+  host_info?: import("./hostInfo.js").HostInfo;
 }
 
 export interface IterationResult {
@@ -276,8 +278,26 @@ export class Reporter {
     return this.startTs;
   }
 
+  /** Read-only snapshot of accumulated iteration results. For HTML/JSON renderers. */
+  getResults(): readonly IterationResult[] {
+    return this.results;
+  }
+
+  /** Current run metadata (git_sha, gpu_renderer, started_at, etc). */
+  getMeta(): RunMeta | null {
+    return this.meta;
+  }
+
   setMeta(meta: RunMeta): void {
     this.meta = meta;
+    this.flushIterations();
+  }
+
+  /** Partial update of run meta — useful for fields detected after run start
+   * (e.g. chrome_user_agent / gpu_renderer captured after first page boot). */
+  updateMeta(patch: Partial<RunMeta>): void {
+    if (!this.meta) return;
+    this.meta = { ...this.meta, ...patch };
     this.flushIterations();
   }
 

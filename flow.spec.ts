@@ -47,6 +47,8 @@ import {
 } from "./helpers/phases.js";
 import { computePhaseMetrics, type IterationResult, Reporter } from "./helpers/reporter.js";
 import { RoomObserver } from "./helpers/roomObserver.js";
+import { buildSummaryHtml } from "./helpers/summaryHtml.js";
+import { getHostInfo } from "./helpers/hostInfo.js";
 
 import { loadConfig } from "./config.js";
 
@@ -69,12 +71,42 @@ function gitSha(): string | null {
 
 reporter.setMeta({
   git_sha: gitSha(),
-  chrome_user_agent: null, // populated after first page boot (set in test)
-  gpu_renderer: process.env.BENCH_GPU_RENDERER || null, // optional; global-setup could persist
+  chrome_user_agent: null, // populated below after first page boot via updateMeta
+  gpu_renderer: process.env.BENCH_GPU_RENDERER || null, // also populated post-boot
   gpu_vendor: process.env.BENCH_GPU_VENDOR || null,
   config_snapshot: { ...cfg },
   started_at: new Date().toISOString(),
+  host_info: getHostInfo(),
 });
+
+/** Pull Chrome user agent + WebGL unmasked renderer/vendor from a live page and
+ * update reporter meta. Called once after the first iteration's page is set up. */
+async function captureBrowserMetaIfMissing(page: Page): Promise<void> {
+  const m = reporter.getMeta();
+  if (!m) return;
+  if (m.chrome_user_agent && m.gpu_renderer) return; // already populated
+  try {
+    const info = await page.evaluate(() => {
+      const c = document.createElement("canvas");
+      const gl = (c.getContext("webgl2") || c.getContext("webgl")) as WebGLRenderingContext | null;
+      let renderer: string | null = null;
+      let vendor: string | null = null;
+      if (gl) {
+        const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+        renderer = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : String(gl.getParameter(gl.RENDERER));
+        vendor = dbg ? String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL)) : String(gl.getParameter(gl.VENDOR));
+      }
+      return { ua: navigator.userAgent, renderer, vendor };
+    });
+    reporter.updateMeta({
+      chrome_user_agent: info.ua,
+      gpu_renderer: m.gpu_renderer ?? info.renderer,
+      gpu_vendor: m.gpu_vendor ?? info.vendor,
+    });
+  } catch (_) {
+    // best-effort — don't fail the test if meta capture fails
+  }
+}
 
 // In dry-run mode we share ONE browser context + ONE page across all iterations
 // → Playwright records ONE combined video for the entire run. Trade-off: cold
@@ -107,6 +139,20 @@ test.afterAll(async () => {
   // Close shared context + save combined video. Video is in baseDir/videos/, NOT
   // runDir — finalize() can rename runDir freely without touching the video file.
   if (sharedContext && sharedPage) {
+    // BEFORE closing the page: render an HTML summary in the browser and hold it
+    // for ~12s so the Playwright video captures the final results at the end.
+    // Saves the user from opening iterations.json to see "did the run work?".
+    try {
+      const html = buildSummaryHtml(reporter.getMeta(), reporter.getResults());
+      const dataUrl = "data:text/html;charset=utf-8," + encodeURIComponent(html);
+      await sharedPage.goto(dataUrl, { waitUntil: "load", timeout: 10_000 });
+      await sharedPage.waitForTimeout(12_000);
+      // Also persist the HTML to the run dir for non-video viewing.
+      fs.writeFileSync(path.join(reporter.runDir, "summary.html"), html);
+    } catch (e) {
+      console.warn(`[flow] summary HTML render failed: ${(e as Error).message}`);
+    }
+
     const videoObj = sharedPage.video();
     await sharedPage.close().catch((e) => {
       console.warn(`[flow] sharedPage.close failed: ${(e as Error).message}`);
@@ -232,6 +278,8 @@ for (const room of cfg.rooms) {
 
       try {
         await page.goto(startUrl, { waitUntil: "domcontentloaded" });
+        // Capture chrome UA + WebGL renderer/vendor once per run (no-op on subsequent iters).
+        await captureBrowserMetaIfMissing(page);
 
         await step1_clickEnter(ctx);
         await step2_closeHelpDialog(ctx);
