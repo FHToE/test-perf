@@ -18,6 +18,10 @@ export interface RoomCounts {
 export class RoomObserver {
   private latest: RoomCounts | null = null;
   private titleByName: Map<string, string> = new Map();
+  // Room counts keyed by slug name. The FF-on app PREFETCHES other rooms'
+  // /public/rooms/<uuid> data, so `latest` is often a prefetched room (e.g. "test-yev"),
+  // not the one we're standing in — read by name via getByName() instead.
+  private byName: Map<string, RoomCounts> = new Map();
   private detached = false;
   private handler: ((resp: Response) => void | Promise<void>) | null = null;
 
@@ -33,12 +37,14 @@ export class RoomObserver {
         const json = await resp.json();
         if (isSingleRoom) {
           const room = json as { showpieces?: unknown[]; neighbors?: unknown[]; name?: string };
-          this.latest = {
+          const counts: RoomCounts = {
             showpieces: Array.isArray(room.showpieces) ? room.showpieces.length : 0,
             neighbors: Array.isArray(room.neighbors) ? room.neighbors.length : 0,
             name: room.name,
             url,
           };
+          this.latest = counts;
+          if (room.name) this.byName.set(room.name, counts);
         } else if (isRoomsList && Array.isArray(json)) {
           for (const r of json as Array<{ name?: string; title?: string }>) {
             if (r.name && r.title) this.titleByName.set(r.name, r.title);
@@ -67,6 +73,11 @@ export class RoomObserver {
   /** Returns the most recent room data, or null if no /public/rooms/<uuid> response has been seen yet. */
   getLatest(): RoomCounts | null {
     return this.latest;
+  }
+
+  /** Room counts for a specific slug name (robust to prefetch overwriting `latest`). */
+  getByName(name: string | null | undefined): RoomCounts | undefined {
+    return name ? this.byName.get(name) : undefined;
   }
 
   /** Clear cached data — call before a navigation/transition so the next read reflects only post-nav state. */

@@ -13,6 +13,9 @@ export interface BenchConfig {
   outputDir: string;
   /** Dry run: force 1 iteration per room, record video, write to results-dry-run/ so real metrics aren't polluted. */
   dryRun: boolean;
+  /** Force museum quality LOD at iteration start (seeds preferences-store → performanceMode=custom + lod=X).
+   * null = do not seed; app picks its own LOD via detect-gpu and may switch at runtime via AutoPerformanceManager. */
+  forceQuality: "low" | "medium" | "high" | null;
 }
 
 function reqEnv(name: string): string {
@@ -45,6 +48,16 @@ export function loadConfig(): BenchConfig {
 
   const dryRun = boolEnv("BENCH_DRY_RUN");
   const defaultOutDir = dryRun ? "./results-dry-run" : "./results";
+
+  const rawQuality = (process.env.BENCH_QUALITY || "").toLowerCase().trim();
+  let forceQuality: BenchConfig["forceQuality"] = null;
+  if (rawQuality !== "") {
+    if (rawQuality !== "low" && rawQuality !== "medium" && rawQuality !== "high") {
+      throw new Error(`BENCH_QUALITY must be one of low|medium|high, got: ${rawQuality}`);
+    }
+    forceQuality = rawQuality;
+  }
+
   return {
     baseUrl: reqEnv("BENCH_BASE_URL").replace(/\/+$/, ""),
     rooms,
@@ -58,5 +71,6 @@ export function loadConfig(): BenchConfig {
     transitionTimeoutSec: numEnv("BENCH_TRANSITION_TIMEOUT_SEC", 60),
     outputDir: process.env.BENCH_OUTPUT_DIR || defaultOutDir,
     dryRun,
+    forceQuality,
   };
 }

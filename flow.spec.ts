@@ -34,6 +34,7 @@ import {
   step8_findAndUsePortal,
   step10_walkAround,
   ensureRoomLoadedWithRetry,
+  dismissStrayOverlays,
 } from "./helpers/flow.js";
 import { attachPageLogger, roomSlug } from "./helpers/pageLogger.js";
 import {
@@ -49,6 +50,8 @@ import { computePhaseMetrics, type IterationResult, Reporter } from "./helpers/r
 import { RoomObserver } from "./helpers/roomObserver.js";
 import { buildSummaryHtml } from "./helpers/summaryHtml.js";
 import { getHostInfo } from "./helpers/hostInfo.js";
+import { buildPreferencesSeedScript } from "./helpers/qualityOverride.js";
+import { FeatureFlagObserver } from "./helpers/featureFlagObserver.js";
 
 import { loadConfig } from "./config.js";
 
@@ -115,6 +118,15 @@ async function captureBrowserMetaIfMissing(page: Page): Promise<void> {
 let sharedContext: BrowserContext | null = null;
 let sharedPage: Page | null = null;
 
+// Backend feature flags. They steer the flow (notably SINGLE_CANVAS_ENABLED changes
+// the minimap from DOM to in-canvas) and are recorded in run_meta so FF-on/off result
+// files aren't compared by accident. Source = INTERCEPTION of the app's own
+// /public/feature-flags requests (robust to the import.meta.env VITE_API_URL override
+// that makes config.json point at the wrong backend). Module-level so a value captured
+// on iteration 1 survives into later iterations even when the app's react-query cache
+// (5min) suppresses a re-fetch (e.g. dry-run shared context).
+const ffObserver = new FeatureFlagObserver();
+
 // Dry-run video lives in `<baseDir>/videos/` (NOT inside runDir) so finalize()'s
 // rename of runDir doesn't race with Playwright's video file handle on Windows.
 const dryRunVideoDir = path.join(reporter.baseRunDir, "videos");
@@ -130,6 +142,11 @@ test.beforeAll(async ({ browser }) => {
   });
   await sharedContext.addInitScript({ content: WEBGL_CAMERA_HOOK_INIT });
   await sharedContext.addInitScript({ content: COLLECTOR_INIT });
+  if (cfg.forceQuality) {
+    await sharedContext.addInitScript({ content: buildPreferencesSeedScript(cfg.forceQuality) });
+    // eslint-disable-next-line no-console
+    console.log(`[flow] dry-run: forcing quality=${cfg.forceQuality} via preferences-store seed`);
+  }
   sharedPage = await sharedContext.newPage();
   // eslint-disable-next-line no-console
   console.log(`[flow] dry-run: shared context + page created — one combined video at end`);
@@ -211,6 +228,9 @@ for (const room of cfg.rooms) {
         context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
         await context.addInitScript({ content: WEBGL_CAMERA_HOOK_INIT });
         await context.addInitScript({ content: COLLECTOR_INIT });
+        if (cfg.forceQuality) {
+          await context.addInitScript({ content: buildPreferencesSeedScript(cfg.forceQuality) });
+        }
         page = await context.newPage();
       }
 
@@ -226,6 +246,9 @@ for (const room of cfg.rooms) {
       const roomObserver = new RoomObserver();
       roomObserver.attach(page);
 
+      // Capture the flags the APP actually reads (host-agnostic) — see FeatureFlagObserver.
+      ffObserver.attach(page);
+
       const notes: string[] = [];
       const ctx: FlowContext = {
         page,
@@ -239,6 +262,14 @@ for (const room of cfg.rooms) {
         notes,
         roomData: roomObserver,
       };
+
+      // Periodic safety net: stray overlays (help/guide, or an exhibit/poster preview
+      // opened by an unintended click) can block the canvas mid-flow. Poll every 2s and
+      // dismiss them via their × — but dismissStrayOverlays leaves the POI alone while
+      // step7 is intentionally holding it (ctx.poiHoldActive).
+      const helpWatcher = setInterval(() => {
+        void dismissStrayOverlays(ctx).catch(() => undefined);
+      }, 2_000);
 
       const startUrl = cfg.baseUrl + "/";
       // eslint-disable-next-line no-console
@@ -302,11 +333,15 @@ for (const room of cfg.rooms) {
         await step4_selectMuseum(ctx, museumName);
         await step5_waitForMuseumLoaded(ctx, museumName, cfg.transitionTimeoutSec * 1000);
 
+        // SINGLE_CANVAS_ENABLED steers step6 (in-canvas vs legacy DOM minimap).
+        // Intercepted from the app's own request (fetched at lobby load); false if unseen.
+        const singleCanvas = (await ffObserver.waitFor("SINGLE_CANVAS_ENABLED", 5_000)) ?? false;
         const inTargetRoom = await step6_ensureTargetRoom(
           ctx,
           museumName,
           targetRoomName,
           cfg.transitionTimeoutSec * 1000,
+          singleCanvas,
         );
         await endPhase(page, PHASE_NAMES.TRANSITION_TO_TARGET);
 
@@ -478,6 +513,11 @@ for (const room of cfg.rooms) {
           notes: notes.length ? notes : undefined,
           diagnostics,
         };
+        // Record the flags the app actually used (intercepted) into run_meta, so
+        // every result file is labeled with the FF state it was measured under.
+        if (ffObserver.hasAny()) {
+          reporter.updateMeta({ feature_flags: ffObserver.snapshot() });
+        }
         reporter.add(result);
 
         // eslint-disable-next-line no-console
@@ -490,7 +530,9 @@ for (const room of cfg.rooms) {
         await page.screenshot({ path: path.join(screenshotsDir, "FAIL-final.png") }).catch(() => undefined);
         throw e;
       } finally {
+        clearInterval(helpWatcher);
         roomObserver.detach(page);
+        ffObserver.detach(page);
         detachLogger();
         flowLogStream.end();
         if (!usingShared) {

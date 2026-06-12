@@ -121,6 +121,10 @@ export interface RunMeta {
   ended_at?: string;
   /** Host machine info captured at run start (os, cpu, ram). */
   host_info?: import("./hostInfo.js").HostInfo;
+  /** Backend feature-flag state at run start. Critical for comparability: a FF-off
+   * baseline must never be diffed against a FF-on run by accident. null = unknown
+   * (API URL unresolved). */
+  feature_flags?: Record<string, boolean> | null;
 }
 
 export interface IterationResult {
