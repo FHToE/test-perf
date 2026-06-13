@@ -31,6 +31,13 @@ export default defineConfig({
         "--ignore-gpu-blocklist",
         "--enable-gpu-rasterization",
         "--enable-zero-copy",
+        // Decouple rendering from the display refresh rate so FPS reflects the GPU
+        // ceiling, not the screen's Hz. Critical on RDP/virtual displays (~32Hz cap)
+        // where the refresh rate can differ BETWEEN runs and silently break the
+        // FF-off vs FF-on FPS comparison. Both flags are needed: vsync gates frame
+        // presentation, the rate-limit caps the compositor.
+        "--disable-gpu-vsync",
+        "--disable-frame-rate-limit",
       ],
     },
   },
